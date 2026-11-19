@@ -4,8 +4,10 @@ import re
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = "voice-room-local-key"
+# Использование eventlet или gevent лучше для продакшена, но threading тоже сработает
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
+# Словарь для хранения комнат: { "1234": ["sid1", "sid2"] }
 rooms = {}
 
 @app.route("/")
@@ -16,20 +18,37 @@ def clean_room(value):
     value = re.sub(r"[^a-zA-Z0-9_-]", "", str(value or ""))[:32]
     return value or "main"
 
+# --- НОВОЕ СОБЫТИЕ ДЛЯ ПРОВЕРКИ СТАТУСА КОМНАТЫ ---
+@socketio.on("check_room")
+def on_check_room(data):
+    room = clean_room((data or {}).get("room"))
+    # Комната считается занятой, если в ней уже есть хотя бы один участник
+    is_occupied = room in rooms and len(rooms[room]) > 0
+    emit("room_status", {"room": room, "occupied": is_occupied})
+
 @socketio.on("join")
 def on_join(data):
     room = clean_room((data or {}).get("room"))
     name = str((data or {}).get("name") or "Гость")[:24]
+    
     members = rooms.setdefault(room, [])
+    
+    # Если в комнате уже 2 человека, не пускаем
     if len(members) >= 2:
         emit("room_full")
         return
+        
     if request.sid in members:
         return
+        
     was_occupied = len(members) > 0
     members.append(request.sid)
     join_room(room)
+    
+    # Отправляем подтверждение входа
     emit("joined", {"room": room, "peer_present": was_occupied})
+    
+    # Если кто-то уже был, сообщаем ему, что мы зашли
     if was_occupied:
         emit("peer_joined", {"name": name}, room=room, include_self=False)
 
@@ -53,10 +72,11 @@ def remove_client(sid):
             members.remove(sid)
             leave_room(room, sid=sid)
             emit("peer_left", room=room, include_self=False)
+            # Если комната опустела, удаляем её из памяти
             if not members:
                 rooms.pop(room, None)
             break
 
 if __name__ == "__main__":
-    print("\\nVoice Room запущен. Для микрофона используйте HTTPS-ссылку из START.bat.\\n")
+    print("\nVoice Room запущен. Для микрофона используйте HTTPS-ссылку.\n")
     socketio.run(app, host="0.0.0.0", port=5000, allow_unsafe_werkzeug=True)
