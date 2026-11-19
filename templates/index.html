@@ -17,6 +17,7 @@ input{width:100%;height:50px;border:1px solid #ffffff16;border-radius:12px;backg
 input:focus{border-color:#6875df}
 button{border:0;border-radius:12px;height:50px;padding:0 24px;color:white;font-weight:700;font-size:15px;cursor:pointer;transition:transform .15s,filter .15s}
 button:active{transform:scale(.97)}
+button:disabled{opacity:0.5;cursor:not-allowed}
 #join{width:100%;background:#5865f2}
 #leave{width:100%;background:#ed4245;display:none}
 .hint{height:18px;color:#a5a7b0;font-size:13px;text-align:center}
@@ -34,7 +35,9 @@ button:active{transform:scale(.97)}
   </div>
   <input id="login" maxlength="24" placeholder="Твой логин" autocomplete="nickname">
   <input id="room" maxlength="32" placeholder="Комната (например: 1234)" value="1234">
+  
   <button id="join">Подключиться</button>
+  
   <div class="actions">
     <button class="mic" id="mute" title="Включить/выключить микрофон">🎙</button>
     <button id="leave">Покинуть звонок</button>
@@ -46,58 +49,184 @@ button:active{transform:scale(.97)}
 <script>
 const $=id=>document.getElementById(id);
 let socket=null, pc=null, localStream=null, joined=false, muted=false, roomName="", makingOffer=false;
+// Флаг для хранения статуса комнаты
+let isRoomOccupied = false; 
 const config={iceServers:[{urls:"stun:stun.l.google.com:19302"},{urls:"stun:stun1.l.google.com:19302"}]};
+
 function status(text,online=false){$("hint").textContent=text;$("statusDot").classList.toggle("online",online)}
 function sendSignal(payload){if(socket&&joined)socket.emit("signal",{room:roomName,payload})}
-async function connect(){
-  if(joined)return;
-  const name=$("login").value.trim()||"Гость"; roomName=$("room").value.trim()||"1234";
-  $("join").disabled=true;status("Разреши доступ к микрофону…");
-  try{
-    localStream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false});
-  }catch(e){$("join").disabled=false;status(e.name==="NotAllowedError"?"Нет доступа к микрофону":"Не удалось включить микрофон");return}
-  socket=io({transports:["websocket","polling"]});
-  socket.on("connect",()=>socket.emit("join",{room:roomName,name}));
-  socket.on("joined",async data=>{
-    joined=true;$("join").style.display="none";$("login").style.display="none";$("room").style.display="none";$("leave").style.display="block";$("mute").style.display="block";
-    status(data.peer_present?"Соединяем…":"Ожидание друга…",true);
-    if(data.peer_present) await makeOffer();
-  });
-  socket.on("room_full",()=>{status("Комната уже занята");cleanup(false)});
-  socket.on("peer_joined",async()=>{if(!pc)await makeOffer()});
-  socket.on("signal",async payload=>{
-    if(!payload)return;
-    try{
-      if(payload.description){
-        await pc.setRemoteDescription(payload.description);
-        if(payload.description.type==="offer"){
-          const answer=await pc.createAnswer();await pc.setLocalDescription(answer);sendSignal({description:pc.localDescription});
+
+// --- 1. ПОДКЛЮЧАЕМСЯ К СЕРВЕРУ СРАЗУ ПРИ ЗАГРУЗКЕ (чтобы проверять комнаты) ---
+socket = io({transports:["websocket","polling"]});
+
+socket.on("connect", () => {
+    console.log("Подключен к серверу для проверки комнат");
+    // Как только подключились, проверяем начальное значение комнаты
+    checkCurrentRoom();
+});
+
+// Слушаем ответ от сервера о статусе комнаты
+socket.on("room_status", (data) => {
+    // Проверяем, что ответ пришел именно для той комнаты, которую сейчас смотрят
+    if (data.room === ($("room").value.trim() || "1234")) {
+        isRoomOccupied = data.occupied;
+        if (isRoomOccupied) {
+            $("join").textContent = "Подключиться в комнату";
+            $("join").style.background = "#43b581"; // Зеленый цвет
+        } else {
+            $("join").textContent = "Создать и войти";
+            $("join").style.background = "#5865f2"; // Синий цвет
         }
-      }else if(payload.candidate){await pc.addIceCandidate(payload.candidate)}
-    }catch(e){console.error(e)}
-  });
-  socket.on("peer_left",()=>{if(pc){pc.close();pc=null} $("remoteAudio").srcObject=null;status("Друг отключился",true)});
-  socket.on("disconnect",()=>{if(joined)status("Соединение потеряно")});
+    }
+});
+
+// Функция для отправки запроса на проверку комнаты
+function checkCurrentRoom() {
+    const room = $("room").value.trim() || "1234";
+    if (socket && socket.connected) {
+        socket.emit("check_room", { room: room });
+    }
 }
+
+// Проверяем комнату каждый раз, когда пользователь меняет цифры
+$("room").addEventListener("input", checkCurrentRoom);
+
+// --- 2. ЛОГИКА ПОДКЛЮЧЕНИЯ И ЗВОНКА ---
+
+async function connect(){
+  if(joined) return;
+  
+  const name = $("login").value.trim() || "Гость";
+  roomName = $("room").value.trim() || "1234";
+  
+  $("join").disabled = true;
+  status("Разреши доступ к микрофону…");
+  
+  try {
+    // Запрашиваем микрофон
+    localStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        video: false
+    });
+  } catch(e) {
+    $("join").disabled = false;
+    status(e.name === "NotAllowedError" ? "Нет доступа к микрофону" : "Не удалось включить микрофон");
+    return;
+  }
+
+  // Отправляем запрос на вход в комнату
+  socket.emit("join", { room: roomName, name: name });
+}
+
+// Обработка успешного входа в комнату
+socket.on("joined", async data => {
+    joined = true;
+    // Скрываем интерфейс выбора, показываем кнопки в звонке
+    $("join").style.display = "none";
+    $("login").style.display = "none";
+    $("room").style.display = "none";
+    $("leave").style.display = "block";
+    $("mute").style.display = "block";
+    
+    status(data.peer_present ? "Соединяем…" : "Ожидание друга…", true);
+    
+    // Если в комнате уже был человек, инициируем соединение
+    if (data.peer_present) await makeOffer();
+});
+
+// Обработка ошибки (если комната занята, пока мы запрашивали микрофон)
+socket.on("room_full", () => {
+    status("Комната уже занята");
+    cleanup(false); // Отключаемся, но не отправляем событие leave на сервер (нас там и так нет)
+});
+
+socket.on("peer_joined", async() => {
+    if (!pc) await makeOffer();
+});
+
+socket.on("signal", async payload => {
+    if(!payload) return;
+    try {
+        if(payload.description) {
+            await pc.setRemoteDescription(payload.description);
+            if(payload.description.type === "offer") {
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+                sendSignal({description: pc.localDescription});
+            }
+        } else if(payload.candidate) {
+            await pc.addIceCandidate(payload.candidate);
+        }
+    } catch(e) { console.error(e); }
+});
+
+socket.on("peer_left", () => {
+    if(pc){ pc.close(); pc=null; } 
+    $("remoteAudio").srcObject=null;
+    status("Друг отключился", true);
+});
+
+// Функция создания WebRTC соединения
 async function makeOffer(){
-  if(pc)return;
-  pc=new RTCPeerConnection(config);
-  localStream.getTracks().forEach(t=>pc.addTrack(t,localStream));
-  pc.ontrack=e=>{$("remoteAudio").srcObject=e.streams[0];$("remoteAudio").play().catch(()=>{});status("На связи",true)};
-  pc.onicecandidate=e=>{if(e.candidate)sendSignal({candidate:e.candidate})};
-  pc.onconnectionstatechange=()=>{if(pc&&pc.connectionState==="connected")status("На связи",true);else if(pc&&["failed","disconnected"].includes(pc.connectionState))status("Переподключение…")};
-  const offer=await pc.createOffer();await pc.setLocalDescription(offer);sendSignal({description:pc.localDescription});
+  if(pc) return;
+  pc = new RTCPeerConnection(config);
+  localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+  
+  pc.ontrack = e => {
+      $("remoteAudio").srcObject = e.streams[0];
+      $("remoteAudio").play().catch(()=>{});
+      status("На связи", true);
+  };
+  pc.onicecandidate = e => {
+      if(e.candidate) sendSignal({candidate: e.candidate});
+  };
+  pc.onconnectionstatechange = () => {
+      if(pc && pc.connectionState === "connected") status("На связи", true);
+      else if(pc && ["failed","disconnected"].includes(pc.connectionState)) status("Переподключение…");
+  };
+  
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  sendSignal({description: pc.localDescription});
 }
+
+// Очистка ресурсов при выходе
 function cleanup(emitLeave=true){
-  if(emitLeave&&socket)socket.emit("leave");
-  joined=false;if(pc){pc.close();pc=null}if(localStream){localStream.getTracks().forEach(t=>t.stop());localStream=null}
-  if(socket){socket.disconnect();socket=null}
-  $("remoteAudio").srcObject=null;$("join").disabled=false;$("join").style.display="block";$("login").style.display="block";$("room").style.display="block";$("leave").style.display="none";$("mute").style.display="none";$("avatar").classList.remove("talking");muted=false;$("mute").textContent="🎙";status("");
+  if(emitLeave && socket) socket.emit("leave");
+  
+  joined = false;
+  if(pc){ pc.close(); pc=null; }
+  if(localStream){ localStream.getTracks().forEach(t=>t.stop()); localStream=null; }
+  
+  $("remoteAudio").srcObject = null;
+  $("join").disabled = false;
+  $("join").style.display = "block";
+  $("login").style.display = "block";
+  $("room").style.display = "block";
+  $("leave").style.display = "none";
+  $("mute").style.display = "none";
+  $("avatar").classList.remove("talking");
+  muted = false;
+  $("mute").textContent = "🎙";
+  status("");
+  
+  // После выхода обновляем статус комнаты
+  checkCurrentRoom();
 }
-$("join").addEventListener("click",connect);
-$("leave").addEventListener("click",()=>cleanup());
-$("mute").addEventListener("click",()=>{if(!localStream)return;muted=!muted;localStream.getAudioTracks().forEach(t=>t.enabled=!muted);$("mute").textContent=muted?"🔇":"🎙"});
-if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){status("Открой HTTPS-ссылку для доступа к микрофону")}
+
+// Навешиваем обработчики на кнопки
+$("join").addEventListener("click", connect);
+$("leave").addEventListener("click", () => cleanup());
+$("mute").addEventListener("click", () => {
+    if(!localStream) return;
+    muted = !muted;
+    localStream.getAudioTracks().forEach(t => t.enabled = !muted);
+    $("mute").textContent = muted ? "🔇" : "🎙";
+});
+
+if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    status("Открой HTTPS-ссылку для доступа к микрофону");
+}
 </script>
 </body>
 </html>
