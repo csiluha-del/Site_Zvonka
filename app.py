@@ -1,11 +1,15 @@
+# ВАЖНО: Эти две строки должны быть самыми первыми в файле!
+import eventlet
+eventlet.monkey_patch()
+
 from flask import Flask, render_template, request
 from flask_socketio import SocketIO, join_room, leave_room, emit
 import re
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = "voice-room-local-key"
-# Использование eventlet или gevent лучше для продакшена, но threading тоже сработает
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+# Используем eventlet для асинхронной работы
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 
 # Словарь для хранения комнат: { "1234": ["sid1", "sid2"] }
 rooms = {}
@@ -18,11 +22,10 @@ def clean_room(value):
     value = re.sub(r"[^a-zA-Z0-9_-]", "", str(value or ""))[:32]
     return value or "main"
 
-# --- НОВОЕ СОБЫТИЕ ДЛЯ ПРОВЕРКИ СТАТУСА КОМНАТЫ ---
+# Проверка статуса комнаты
 @socketio.on("check_room")
 def on_check_room(data):
     room = clean_room((data or {}).get("room"))
-    # Комната считается занятой, если в ней уже есть хотя бы один участник
     is_occupied = room in rooms and len(rooms[room]) > 0
     emit("room_status", {"room": room, "occupied": is_occupied})
 
@@ -79,4 +82,4 @@ def remove_client(sid):
 
 if __name__ == "__main__":
     print("\nVoice Room запущен. Для микрофона используйте HTTPS-ссылку.\n")
-    socketio.run(app, host="0.0.0.0", port=5000, allow_unsafe_werkzeug=True)
+    socketio.run(app, host="0.0.0.0", port=5000)
