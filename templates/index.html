@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Voice Room</title>
+<style>
+*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;font-family:Inter,Arial,sans-serif;background:#17181d;color:#fff}
+body{display:flex;align-items:center;justify-content:center;overflow:hidden;background:radial-gradient(ellipse at 50% 35%,#292b35 0,#1b1c23 48%,#131419 100%)}
+.panel{width:min(440px,92vw);min-height:390px;padding:34px 28px 28px;border-radius:26px;background:rgba(31,33,42,.92);box-shadow:0 24px 80px #0008;border:1px solid #ffffff12;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:22px}
+.avatar{width:116px;height:116px;border-radius:50%;display:grid;place-items:center;background:linear-gradient(145deg,#7289da,#5865f2);box-shadow:0 0 0 9px #5865f21a,0 12px 35px #0006;position:relative;transition:.25s}
+.avatar svg{width:58px;height:58px;fill:#fff}
+.avatar.talking{box-shadow:0 0 0 9px #43b58122,0 0 0 17px #43b58112,0 0 38px #43b58188}
+.status{width:10px;height:10px;border-radius:50%;background:#747783;position:absolute;right:4px;bottom:8px;border:2px solid #292b35}
+.status.online{background:#43b581}
+input{width:100%;height:50px;border:1px solid #ffffff16;border-radius:12px;background:#17181f;color:white;text-align:center;font-size:16px;outline:none;padding:0 14px}
+input:focus{border-color:#6875df}
+button{border:0;border-radius:12px;height:50px;padding:0 24px;color:white;font-weight:700;font-size:15px;cursor:pointer;transition:transform .15s,filter .15s}
+button:active{transform:scale(.97)}
+#join{width:100%;background:#5865f2}
+#leave{width:100%;background:#ed4245;display:none}
+.hint{height:18px;color:#a5a7b0;font-size:13px;text-align:center}
+.actions{width:100%;display:flex;gap:10px}
+.mic{display:none;width:50px;flex:0 0 50px;background:#3b3d49;padding:0;font-size:20px}
+#leave{flex:1}
+@media(max-height:520px){.panel{min-height:0;padding:20px;gap:14px}.avatar{width:86px;height:86px}.avatar svg{width:44px}}
+</style>
+</head>
+<body>
+<main class="panel">
+  <div class="avatar" id="avatar">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 12a4.5 4.5 0 1 0 0-9 4.5 4.5 0 0 0 0 9Zm0 2c-4.2 0-7.5 2.15-7.5 4.8V21h15v-2.2c0-2.65-3.3-4.8-7.5-4.8Z"/></svg>
+    <span class="status" id="statusDot"></span>
+  </div>
+  <input id="login" maxlength="24" placeholder="Твой логин" autocomplete="nickname">
+  <input id="room" maxlength="32" placeholder="Комната (например: 1234)" value="1234">
+  <button id="join">Подключиться</button>
+  <div class="actions">
+    <button class="mic" id="mute" title="Включить/выключить микрофон">🎙</button>
+    <button id="leave">Покинуть звонок</button>
+  </div>
+  <div class="hint" id="hint"></div>
+</main>
+<audio id="remoteAudio" autoplay playsinline></audio>
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<script>
+const $=id=>document.getElementById(id);
+let socket=null, pc=null, localStream=null, joined=false, muted=false, roomName="", makingOffer=false;
+const config={iceServers:[{urls:"stun:stun.l.google.com:19302"},{urls:"stun:stun1.l.google.com:19302"}]};
+function status(text,online=false){$("hint").textContent=text;$("statusDot").classList.toggle("online",online)}
+function sendSignal(payload){if(socket&&joined)socket.emit("signal",{room:roomName,payload})}
+async function connect(){
+  if(joined)return;
+  const name=$("login").value.trim()||"Гость"; roomName=$("room").value.trim()||"1234";
+  $("join").disabled=true;status("Разреши доступ к микрофону…");
+  try{
+    localStream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false});
+  }catch(e){$("join").disabled=false;status(e.name==="NotAllowedError"?"Нет доступа к микрофону":"Не удалось включить микрофон");return}
+  socket=io({transports:["websocket","polling"]});
+  socket.on("connect",()=>socket.emit("join",{room:roomName,name}));
+  socket.on("joined",async data=>{
+    joined=true;$("join").style.display="none";$("login").style.display="none";$("room").style.display="none";$("leave").style.display="block";$("mute").style.display="block";
+    status(data.peer_present?"Соединяем…":"Ожидание друга…",true);
+    if(data.peer_present) await makeOffer();
+  });
+  socket.on("room_full",()=>{status("Комната уже занята");cleanup(false)});
+  socket.on("peer_joined",async()=>{if(!pc)await makeOffer()});
+  socket.on("signal",async payload=>{
+    if(!payload)return;
+    try{
+      if(payload.description){
+        await pc.setRemoteDescription(payload.description);
+        if(payload.description.type==="offer"){
+          const answer=await pc.createAnswer();await pc.setLocalDescription(answer);sendSignal({description:pc.localDescription});
+        }
+      }else if(payload.candidate){await pc.addIceCandidate(payload.candidate)}
+    }catch(e){console.error(e)}
+  });
+  socket.on("peer_left",()=>{if(pc){pc.close();pc=null} $("remoteAudio").srcObject=null;status("Друг отключился",true)});
+  socket.on("disconnect",()=>{if(joined)status("Соединение потеряно")});
+}
+async function makeOffer(){
+  if(pc)return;
+  pc=new RTCPeerConnection(config);
+  localStream.getTracks().forEach(t=>pc.addTrack(t,localStream));
+  pc.ontrack=e=>{$("remoteAudio").srcObject=e.streams[0];$("remoteAudio").play().catch(()=>{});status("На связи",true)};
+  pc.onicecandidate=e=>{if(e.candidate)sendSignal({candidate:e.candidate})};
+  pc.onconnectionstatechange=()=>{if(pc&&pc.connectionState==="connected")status("На связи",true);else if(pc&&["failed","disconnected"].includes(pc.connectionState))status("Переподключение…")};
+  const offer=await pc.createOffer();await pc.setLocalDescription(offer);sendSignal({description:pc.localDescription});
+}
+function cleanup(emitLeave=true){
+  if(emitLeave&&socket)socket.emit("leave");
+  joined=false;if(pc){pc.close();pc=null}if(localStream){localStream.getTracks().forEach(t=>t.stop());localStream=null}
+  if(socket){socket.disconnect();socket=null}
+  $("remoteAudio").srcObject=null;$("join").disabled=false;$("join").style.display="block";$("login").style.display="block";$("room").style.display="block";$("leave").style.display="none";$("mute").style.display="none";$("avatar").classList.remove("talking");muted=false;$("mute").textContent="🎙";status("");
+}
+$("join").addEventListener("click",connect);
+$("leave").addEventListener("click",()=>cleanup());
+$("mute").addEventListener("click",()=>{if(!localStream)return;muted=!muted;localStream.getAudioTracks().forEach(t=>t.enabled=!muted);$("mute").textContent=muted?"🔇":"🎙"});
+if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){status("Открой HTTPS-ссылку для доступа к микрофону")}
+</script>
+</body>
+</html>
